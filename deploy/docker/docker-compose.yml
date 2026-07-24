@@ -12,9 +12,17 @@ services:
       # fast if OPENJARVIS_API_KEY is unset (set it in deploy/docker/.env —
       # see .env.example, or `export` it). Generate one: `jarvis auth generate-key`.
       - OPENJARVIS_API_KEY=${OPENJARVIS_API_KEY:?OPENJARVIS_API_KEY must be set (see deploy/docker/.env.example)}
+    volumes:
+      # Persists config.toml + memory.db/telemetry.db/traces.db (core/paths.py's
+      # single consolidated root) across container recreation. Owned by the
+      # image's non-root openjarvis uid/gid 10001, matching this volume's
+      # first-writer ownership since the image never runs as root.
+      - jarvis-home:/home/openjarvis/.openjarvis
     depends_on:
       ollama:
         condition: service_healthy
+    networks:
+      - openjarvis
     restart: unless-stopped
 
   ollama:
@@ -31,7 +39,17 @@ services:
       timeout: 3s
       retries: 10
       start_period: 10s
+    networks:
+      - openjarvis
     restart: unless-stopped
+
+networks:
+  # Named explicitly (rather than relying on the default project network) so
+  # opt-in override files, e.g. docker-compose.sandbox.yml, can join the same
+  # network by name regardless of the project/directory compose is invoked from.
+  openjarvis:
+    name: openjarvis
 
 volumes:
   ollama-models:
+  jarvis-home:

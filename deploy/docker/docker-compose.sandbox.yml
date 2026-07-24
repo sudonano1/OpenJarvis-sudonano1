@@ -1,0 +1,44 @@
+# Sandbox override — OPT IN ONLY, not part of the default stack. Use with:
+#   export DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+#   docker compose -f deploy/docker/docker-compose.yml -f deploy/docker/docker-compose.sandbox.yml up --build
+# (deploy/docker/stack.sh --sandbox up does this for you.)
+#
+# This enables sandbox.ContainerRunner: jarvis shells out to `docker` to
+# launch openjarvis-sandbox containers as siblings of itself for isolated
+# agent code execution.
+#
+# SECURITY WARNING: mounting the host's /var/run/docker.sock into a container
+# is equivalent to giving that container root on the HOST — anything able to
+# reach the socket can start a privileged container and escape confinement.
+# Only enable this on a host you trust the jarvis workload on, and never pair
+# it with exposing the jarvis API port to an untrusted network.
+#
+# Known gap: openjarvis.sandbox.entrypoint (Dockerfile.sandbox's ENTRYPOINT)
+# does not exist yet in src/openjarvis/sandbox/ as of this writing, so a
+# launched sandbox container will build but fail at run time until that
+# module is added upstream. The sandbox image still builds and tags cleanly
+# via `docker compose ... build sandbox`, which is all this override does by
+# default (the service is never part of `up`).
+
+services:
+  jarvis:
+    build:
+      args:
+        WITH_DOCKER_CLI: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID to the host docker socket's group id: export DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)}"
+
+  # Build-only. Produces the openjarvis-sandbox:latest image that
+  # ContainerRunner launches on demand — it is intentionally never started as
+  # a long-running container (the "never-run" profile is never activated by
+  # `up`), but `docker compose ... build sandbox` builds and tags it by name
+  # regardless of profile activation.
+  sandbox:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.sandbox
+    image: openjarvis-sandbox:latest
+    profiles:
+      - never-run

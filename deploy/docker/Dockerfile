@@ -69,6 +69,19 @@ COPY --from=builder /usr/local /usr/local
 COPY --from=builder /app /app
 WORKDIR /app
 
+# Off by default: the sandbox.ContainerRunner feature shells out to a local
+# `docker` binary to launch openjarvis-sandbox containers as siblings of this
+# one (Docker-out-of-Docker), which requires the CLI here plus the host's
+# docker.sock mounted in at run time (deploy/docker/docker-compose.sandbox.yml
+# does both, opt-in only — see that file for the security tradeoff). Skipped
+# by default so the base image stays minimal and root-install-free.
+ARG WITH_DOCKER_CLI=false
+RUN if [ "$WITH_DOCKER_CLI" = "true" ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends docker.io && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # Run as an unprivileged user — the server needs no root privileges, so dropping
 # them limits the blast radius of a compromise (#565). The app writes only to
 # $HOME (config/cache/state), which is owned by this user.

@@ -13,15 +13,20 @@ cp .env.example .env
 echo "OPENJARVIS_API_KEY=$(jarvis auth generate-key)" > .env   # or paste your own
 ```
 
-Then start both the API server and an Ollama backend with Docker Compose:
+Then start both the API server and an Ollama backend. `deploy/docker/stack.sh`
+is a thin wrapper around `docker compose` that picks the right `-f` file
+combination for you (base stack, GPU override, sandbox override) instead of
+having to remember them:
 
 ```bash
-docker compose up -d
+deploy/docker/stack.sh up
 ```
 
-`docker compose` reads `OPENJARVIS_API_KEY` from `.env` (or your shell
-environment) and fails fast if it is unset. Clients must then send
-`Authorization: Bearer <key>` on `/v1/*` and `/api/*` requests.
+This is equivalent to
+`docker compose -f deploy/docker/docker-compose.yml up -d --build` if you'd
+rather invoke Compose directly. `OPENJARVIS_API_KEY` is read from `.env` (or
+your shell environment) and Compose fails fast if it is unset. Clients must
+then send `Authorization: Bearer <key>` on `/v1/*` and `/api/*` requests.
 
 This brings up two services:
 
@@ -138,35 +143,51 @@ docker run -d --gpus all -p 8000:8000 openjarvis:gpu
 
 ## Docker Compose Configuration
 
-The `docker-compose.yml` defines a complete deployment with the OpenJarvis API server and an Ollama backend:
+`deploy/docker/docker-compose.yml` defines a complete deployment with the
+OpenJarvis API server and an Ollama backend (see that file for the exact,
+current definition — base images are pinned by digest, so treat this as an
+illustrative excerpt rather than something to copy verbatim):
 
 ```yaml
-version: "3.9"
-
 services:
   jarvis:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
     ports:
       - "8000:8000"
     environment:
       - OPENJARVIS_ENGINE_DEFAULT=ollama
-      - OPENJARVIS_OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_HOST=http://ollama:11434
+      - OPENJARVIS_API_KEY=${OPENJARVIS_API_KEY:?...}
+    volumes:
+      - jarvis-home:/home/openjarvis/.openjarvis
     depends_on:
-      - ollama
+      ollama:
+        condition: service_healthy
+    networks:
+      - openjarvis
     restart: unless-stopped
 
   ollama:
-    image: ollama/ollama
+    image: ollama/ollama:0.30.10@sha256:...
     ports:
       - "11434:11434"
     volumes:
       - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+    networks:
+      - openjarvis
     restart: unless-stopped
+
+networks:
+  openjarvis:
+    name: openjarvis
 
 volumes:
   ollama-models:
+  jarvis-home:
 ```
 
 ### Environment Variables
@@ -176,89 +197,100 @@ The `jarvis` service is configured through environment variables:
 | Variable                      | Description                                             | Default                    |
 |-------------------------------|---------------------------------------------------------|----------------------------|
 | `OPENJARVIS_ENGINE_DEFAULT`   | Inference engine backend to use                         | `ollama`                   |
-| `OPENJARVIS_OLLAMA_HOST`      | URL of the Ollama server (uses Docker service name)     | `http://ollama:11434`      |
+| `OLLAMA_HOST`                 | URL of the Ollama server (uses the Docker service name) | `http://ollama:11434`      |
+| `OPENJARVIS_API_KEY`          | Required — the container binds `0.0.0.0`, so Compose refuses to start without this set | none, must be set |
+
+### Networks
+
+Both services join one explicitly-named `openjarvis` Compose network (rather
+than the compose-project-default network), so overrides — the GPU and
+sandbox files below — can join it by name regardless of which directory
+Compose is invoked from.
 
 ### Volumes
 
-The `ollama-models` named volume persists downloaded models across container restarts, so models do not need to be re-pulled after a `docker compose down` / `docker compose up` cycle.
+- `ollama-models` persists downloaded models across container restarts, so
+  models do not need to be re-pulled after a `docker compose down` /
+  `docker compose up` cycle.
+- `jarvis-home` persists the entire OpenJarvis state root (`config.toml`,
+  `memory.db`, `telemetry.db`, `traces.db` — see "Persisting Data" below) at
+  `/home/openjarvis/.openjarvis`, the non-root `openjarvis` user's home
+  directory inside the container. This is mounted by default; you do not need
+  to add it yourself.
 
 ### Service Dependencies
 
-The `jarvis` service declares `depends_on: ollama`, ensuring the Ollama container starts before the API server. Both services use `restart: unless-stopped` to automatically recover from crashes.
+The `jarvis` service's `depends_on` waits for Ollama's `service_healthy`
+condition (not just container-started), so the API server never starts
+racing an Ollama backend that isn't ready to serve yet. Both services use
+`restart: unless-stopped` to automatically recover from crashes.
 
 ## Custom Configuration
 
 ### Mounting a Configuration File
 
-To use a custom `config.toml`, mount it into the container at the expected path (`~/.openjarvis/config.toml`, which is `/root/.openjarvis/config.toml` in the container):
+The image's non-root user is `openjarvis` (uid/gid `10001`), whose home is
+`/home/openjarvis` — not `/root`, since the process never runs as root. To
+use a custom `config.toml`, mount it at that path:
 
 ```yaml
 services:
   jarvis:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    ports:
-      - "8000:8000"
     volumes:
-      - ./my-config.toml:/root/.openjarvis/config.toml:ro
-    environment:
-      - OPENJARVIS_ENGINE_DEFAULT=ollama
-      - OPENJARVIS_OLLAMA_HOST=http://ollama:11434
-    depends_on:
-      - ollama
-    restart: unless-stopped
+      - jarvis-home:/home/openjarvis/.openjarvis
+      - ./my-config.toml:/home/openjarvis/.openjarvis/config.toml:ro
 ```
 
 ### Persisting Data
 
-To persist telemetry data, memory databases, and trace records across container restarts, mount the entire OpenJarvis data directory:
-
-```yaml
-services:
-  jarvis:
-    # ... other config ...
-    volumes:
-      - openjarvis-data:/root/.openjarvis
-
-volumes:
-  ollama-models:
-  openjarvis-data:
-```
-
-This preserves:
+Handled by default — no action needed. `docker-compose.yml`'s `jarvis-home`
+named volume already mounts the entire OpenJarvis state root at
+`/home/openjarvis/.openjarvis`, preserving:
 
 - `telemetry.db` -- inference call telemetry records
 - `memory.db` -- the default SQLite memory backend
 - `traces.db` -- interaction trace records
 - `config.toml` -- user configuration
 
-### Using the GPU Image with Compose
+across `docker compose down` / `up` cycles. `docker compose down --volumes`
+(or `deploy/docker/stack.sh down -- --volumes`) still removes it if you
+deliberately want a clean slate.
 
-To use the GPU Dockerfile in your Compose setup, change the `dockerfile` field and add GPU resource reservations:
+### GPU
 
-```yaml
-services:
-  jarvis:
-    build:
-      context: .
-      dockerfile: Dockerfile.gpu
-    ports:
-      - "8000:8000"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    environment:
-      - OPENJARVIS_ENGINE_DEFAULT=ollama
-      - OPENJARVIS_OLLAMA_HOST=http://ollama:11434
-    depends_on:
-      - ollama
-    restart: unless-stopped
+Use the digest-pinned override files rather than hand-editing the base
+compose file — they're already wired up:
+
+```bash
+deploy/docker/stack.sh --gpu nvidia up   # docker-compose.gpu.nvidia.yml — requires the NVIDIA Container Toolkit
+deploy/docker/stack.sh --gpu rocm up     # docker-compose.gpu.rocm.yml — requires host ROCm + /dev/kfd, /dev/dri access
 ```
+
+Each override swaps `jarvis`'s `dockerfile` to the matching GPU variant
+(`Dockerfile.gpu` / `Dockerfile.gpu.rocm`) and adds the device
+reservations/mounts that variant needs; see the override files themselves for
+the exact device list.
+
+### Sandbox (opt-in, security-sensitive)
+
+`Dockerfile.sandbox` builds the `openjarvis-sandbox:latest` image that
+`sandbox.ContainerRunner` shells out to `docker` to launch on demand, for
+isolated agent code execution. It is not part of the default stack:
+
+```bash
+deploy/docker/stack.sh --sandbox up
+```
+
+enabling it mounts the **host's** `/var/run/docker.sock` into the `jarvis`
+container so it can launch those sibling containers (Docker-out-of-Docker).
+**This is equivalent to granting the `jarvis` container root on the host** —
+anything able to reach the socket can start a privileged container and
+escape confinement. Only enable it on a host you trust the jarvis workload
+on, and never combine it with exposing the API port to an untrusted network.
+See `deploy/docker/docker-compose.sandbox.yml` for the full detail, including
+a known upstream gap: `openjarvis.sandbox.entrypoint` doesn't exist yet under
+`src/openjarvis/sandbox/`, so a launched sandbox container currently builds
+but fails immediately at run time until that module is added.
 
 ## Health Check
 

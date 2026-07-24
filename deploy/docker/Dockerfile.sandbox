@@ -67,4 +67,14 @@ WORKDIR /app
 
 LABEL openjarvis-sandbox=true
 
+# Same non-root uid/gid as deploy/docker/Dockerfile's runtime image (#565) so
+# files written under a mount shared with the jarvis service (e.g. a workspace
+# volume) keep consistent ownership across both containers.
+RUN groupadd --system --gid 10001 openjarvis && \
+    useradd --system --uid 10001 --gid openjarvis \
+        --create-home --home-dir /home/openjarvis openjarvis && \
+    chown -R openjarvis:openjarvis /app
+ENV HOME=/home/openjarvis
+USER openjarvis
+
 ENTRYPOINT ["python", "-m", "openjarvis.sandbox.entrypoint"]
